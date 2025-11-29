@@ -73,6 +73,39 @@
                 android:layout_height="wrap_content"
                 android:valueFrom="100.0"
                 android:valueTo="3200.0" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:layout_marginTop="8dp">
+
+                <Button
+                    android:id="@+id/btnResetAuto"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginEnd="8dp"
+                    android:text="Reset Auto"
+                    android:textSize="10sp"
+                    style="@style/Widget.Material3.Button.OutlinedButton"
+                    android:textColor="@android:color/white"/>
+
+                <com.google.android.material.materialswitch.MaterialSwitch
+                    android:id="@+id/switchRaw"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="RAW"
+                    android:textColor="@android:color/white"
+                    android:layout_marginEnd="8dp"/>
+
+                <com.google.android.material.materialswitch.MaterialSwitch
+                    android:id="@+id/switchHdr"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="HDR"
+                    android:textColor="@android:color/white"/>
+            </LinearLayout>
         </LinearLayout>
 
         <!-- Main Buttons -->

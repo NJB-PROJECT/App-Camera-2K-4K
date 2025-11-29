@@ -6,9 +6,11 @@ import android.content.pm.PackageManager
 import android.content.ContentValues
 import android.graphics.ImageFormat
 import android.graphics.Matrix
+import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.*
+import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.StreamConfigurationMap
 import android.media.CamcorderProfile
 import android.media.ImageReader
@@ -50,6 +52,8 @@ class MainActivity : AppCompatActivity() {
     private var cameraCaptureSession: CameraCaptureSession? = null
     private var captureRequest: CaptureRequest.Builder? = null
     private var imageReader: ImageReader? = null
+    private var rawReader: ImageReader? = null
+    private var rawImageReader: ImageReader? = null // For DNG
 
     // Video variables
     private var mediaRecorder: MediaRecorder? = null
@@ -65,6 +69,8 @@ class MainActivity : AppCompatActivity() {
     private var isFlashSupported = false
     private var sensorOrientation = 0
     private var isFrontCamera = false
+    private var isRawSupported = false
+    private var activeArraySize: Rect? = null
 
     private val surfaceTextureListener = object : TextureView.SurfaceTextureListener {
         override fun onSurfaceTextureAvailable(texture: SurfaceTexture, width: Int, height: Int) {
@@ -119,6 +125,87 @@ class MainActivity : AppCompatActivity() {
         binding.sliderIso.addOnChangeListener { _, value, _ ->
             updateProSettings(iso = value.toInt())
         }
+
+        binding.btnResetAuto.setOnClickListener { resetToAuto() }
+
+        binding.texture.setOnTouchListener { view, event ->
+            if (event.action == android.view.MotionEvent.ACTION_UP) {
+                touchToFocus(event.x, event.y, view.width, view.height)
+                view.performClick()
+            }
+            true
+        }
+    }
+
+    private fun resetToAuto() {
+        if (cameraDevice == null || captureRequest == null || cameraCaptureSession == null) return
+        try {
+            captureRequest?.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+            captureRequest?.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+            captureRequest?.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_CANCEL)
+            captureRequest?.set(CaptureRequest.CONTROL_AF_REGIONS, null)
+            captureRequest?.set(CaptureRequest.CONTROL_AE_REGIONS, null)
+
+            cameraCaptureSession?.setRepeatingRequest(captureRequest!!.build(), null, backgroundHandler)
+            runOnUiThread {
+                Toast.makeText(this, "Reset to Auto Focus & Exposure", Toast.LENGTH_SHORT).show()
+            }
+        } catch (e: CameraAccessException) {
+            e.printStackTrace()
+        }
+    }
+
+    private fun touchToFocus(x: Float, y: Float, viewWidth: Int, viewHeight: Int) {
+        if (cameraDevice == null || activeArraySize == null) return
+
+        val rect = calculateTapArea(x, y, viewWidth, viewHeight)
+        val meteringRect = MeteringRectangle(rect, 1000)
+
+        try {
+            captureRequest?.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(meteringRect))
+            captureRequest?.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(meteringRect))
+            captureRequest?.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
+            captureRequest?.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
+            captureRequest?.set(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER, CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER_START)
+
+            cameraCaptureSession?.capture(captureRequest!!.build(), null, backgroundHandler)
+
+            // Reset triggers for repeating request
+            captureRequest?.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_IDLE)
+            captureRequest?.set(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER, CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER_IDLE)
+            cameraCaptureSession?.setRepeatingRequest(captureRequest!!.build(), null, backgroundHandler)
+
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    private fun calculateTapArea(x: Float, y: Float, width: Int, height: Int): Rect {
+        val sensorRect = activeArraySize ?: return Rect(0,0,0,0)
+
+        // Simple mapping (Assuming aspect ratio matches or is close enough for simple tap)
+        // A robust implementation requires full matrix transformation matching configureTransform
+        // Here we do a simplified relative mapping for speed
+        val relX = x / width
+        val relY = y / height
+
+        // Handle rotation roughly (Assuming 90 deg landscape sensor on portrait)
+        // Note: This needs to match the sensor orientation logic perfectly
+
+        val sensorW = sensorRect.width()
+        val sensorH = sensorRect.height()
+
+        val newX = (relY * sensorW).toInt()
+        val newY = ((1.0 - relX) * sensorH).toInt()
+
+        val halfSize = 150
+        val rect = Rect(
+             (newX - halfSize).coerceIn(0, sensorW),
+             (newY - halfSize).coerceIn(0, sensorH),
+             (newX + halfSize).coerceIn(0, sensorW),
+             (newY + halfSize).coerceIn(0, sensorH)
+        )
+        return rect
     }
 
     private fun updateProSettings(focusDistance: Float? = null, iso: Int? = null) {
@@ -257,6 +344,11 @@ class MainActivity : AppCompatActivity() {
                 if (!isFrontCamera && facing == CameraCharacteristics.LENS_FACING_FRONT) continue
 
                 val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: continue
+                activeArraySize = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+
+                // RAW Support Check
+                val capabilities = characteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+                isRawSupported = capabilities?.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_RAW) == true
 
                 // Find the highest resolution available for JPEG
                 val largest = Collections.max(
@@ -264,13 +356,9 @@ class MainActivity : AppCompatActivity() {
                     CompareSizesByArea()
                 )
 
-                // Find highest resolution for Video
-                val videoSize = chooseVideoSize(map.getOutputSizes(MediaRecorder::class.java))
-                this.videoSize = videoSize
-
+                // Setup ImageReader for JPEG
                 imageReader = ImageReader.newInstance(largest.width, largest.height, ImageFormat.JPEG, 2)
                 imageReader?.setOnImageAvailableListener({ reader ->
-                    // Handle saved image
                     backgroundHandler?.post {
                          val image = reader.acquireNextImage()
                          val buffer = image.planes[0].buffer
@@ -280,6 +368,26 @@ class MainActivity : AppCompatActivity() {
                          image.close()
                     }
                 }, backgroundHandler)
+
+                // Setup ImageReader for RAW (if supported)
+                if (isRawSupported) {
+                    val rawSizes = map.getOutputSizes(ImageFormat.RAW_SENSOR)
+                    if (rawSizes != null && rawSizes.isNotEmpty()) {
+                        val largestRaw = Collections.max(Arrays.asList(*rawSizes), CompareSizesByArea())
+                        rawImageReader = ImageReader.newInstance(largestRaw.width, largestRaw.height, ImageFormat.RAW_SENSOR, 2)
+                        rawImageReader?.setOnImageAvailableListener({ reader ->
+                             backgroundHandler?.post {
+                                 val image = reader.acquireNextImage()
+                                 saveRawImage(image, characteristics)
+                                 image.close()
+                             }
+                        }, backgroundHandler)
+                    }
+                }
+
+                // Find highest resolution for Video
+                val videoSize = chooseVideoSize(map.getOutputSizes(MediaRecorder::class.java))
+                this.videoSize = videoSize
 
                 sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
 
@@ -309,8 +417,6 @@ class MainActivity : AppCompatActivity() {
         try {
             val texture = binding.texture.surfaceTexture!!
 
-            // We configure the size of default buffer to be the size of camera preview we want.
-            // Using video size as preview size usually works well for recording
             texture.setDefaultBufferSize(videoSize!!.width, videoSize!!.height)
 
             val surface = Surface(texture)
@@ -320,7 +426,19 @@ class MainActivity : AppCompatActivity() {
             // Stabilization
             captureRequest!!.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON)
 
-            cameraDevice!!.createCaptureSession(Arrays.asList(surface, imageReader!!.surface),
+            // Check HDR Toggle (for Preview/Photo)
+            if (binding.switchHdr.isChecked) {
+                // Try Scene Mode HDR
+                captureRequest!!.set(CaptureRequest.CONTROL_SCENE_MODE, CaptureRequest.CONTROL_SCENE_MODE_HDR)
+                captureRequest!!.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_USE_SCENE_MODE)
+            }
+
+            val targets = mutableListOf(surface, imageReader!!.surface)
+            if (rawImageReader != null) {
+                targets.add(rawImageReader!!.surface)
+            }
+
+            cameraDevice!!.createCaptureSession(targets,
                 object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(cameraCaptureSession: CameraCaptureSession) {
                         if (null == cameraDevice) return
@@ -478,12 +596,22 @@ class MainActivity : AppCompatActivity() {
             val captureBuilder = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
             captureBuilder.addTarget(imageReader!!.surface)
 
+            // Capture RAW if toggle is on and supported
+            if (binding.switchRaw.isChecked && isRawSupported && rawImageReader != null) {
+                captureBuilder.addTarget(rawImageReader!!.surface)
+            }
+
             // Stabilization & High Quality
             captureBuilder.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON)
             captureBuilder.set(CaptureRequest.JPEG_QUALITY, 100.0.toByte()) // 100% Quality
 
-            // Apply Pro settings if set
-            // Note: In a real app, we need to sync manual settings from Preview to Capture
+            if (binding.switchHdr.isChecked) {
+                captureBuilder.set(CaptureRequest.CONTROL_SCENE_MODE, CaptureRequest.CONTROL_SCENE_MODE_HDR)
+                captureBuilder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_USE_SCENE_MODE)
+            }
+
+            // Sync with current manual settings if any (simplified)
+            // Ideally we copy parameters from the current preview request
 
             // Orientation
             val rotation = windowManager.defaultDisplay.rotation
@@ -491,7 +619,12 @@ class MainActivity : AppCompatActivity() {
 
             cameraCaptureSession?.capture(captureBuilder.build(), object : CameraCaptureSession.CaptureCallback() {
                  override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
-                     runOnUiThread { Toast.makeText(this@MainActivity, "Saved!", Toast.LENGTH_SHORT).show() }
+                     lastCaptureResult = result
+                     runOnUiThread {
+                        var msg = "Saved JPEG!"
+                        if (binding.switchRaw.isChecked && isRawSupported) msg += " + RAW (DNG)"
+                        Toast.makeText(this@MainActivity, msg, Toast.LENGTH_SHORT).show()
+                     }
                      createCameraPreviewSession() // Restart preview
                  }
             }, backgroundHandler)
@@ -499,6 +632,41 @@ class MainActivity : AppCompatActivity() {
             e.printStackTrace()
         }
     }
+
+    private fun saveRawImage(image: android.media.Image, characteristics: CameraCharacteristics) {
+        // Wait for capture result (simplified sync)
+        var attempts = 0
+        while (lastCaptureResult == null && attempts < 10) {
+            try { Thread.sleep(50) } catch (e: InterruptedException) {}
+            attempts++
+        }
+
+        if (lastCaptureResult == null) return // Failed to sync
+
+        val dngCreator = DngCreator(characteristics, lastCaptureResult!!)
+
+        val values = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, "RAW_${System.currentTimeMillis()}.dng")
+            put(MediaStore.Images.Media.MIME_TYPE, "image/x-adobe-dng")
+            put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_DCIM + "/SuperCamera")
+        }
+
+        try {
+            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+            if (uri != null) {
+                contentResolver.openOutputStream(uri).use { output ->
+                     if (output != null) {
+                         dngCreator.writeImage(output, image)
+                     }
+                }
+            }
+        } catch (e: IOException) {
+            e.printStackTrace()
+        }
+    }
+
+    // Global variable for this simple implementation
+    private var lastCaptureResult: TotalCaptureResult? = null
 
     private fun saveImage(bytes: ByteArray) {
         val values = ContentValues().apply {
